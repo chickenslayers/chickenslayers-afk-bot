@@ -38,7 +38,11 @@ function createBot() {
     if (botActive) return;
     botActive = true;
     var connected = 0;
-    var movementTimeout = null;
+
+    // Hareket state'i artık setTimeout yerine physicsTick'e bağlı.
+    // Bu, sunucunun beklediği 50ms'lik tick aralığıyla senkron kalmasını sağlar
+    // ve Grim gibi anticheat'lerin "TickTimer failed" / "type=flying" uyarılarını tetiklemesini önler.
+    var movementState = null; // { type: 'moving'|'waiting', ticksLeft, action, midLookDone }
 
     bot = mineflayer.createBot({ 
         host: host, 
@@ -54,14 +58,13 @@ function createBot() {
         saveChatMessage(username, message);
     });
 
+    // NOT: Knockback'i elle uygulayan blok kaldırıldı.
+    // Mineflayer zaten sunucudan gelen knockback'i fizik motoruyla uyguluyor;
+    // buna elle velocity eklemek ani/beklenmeyen dikey hareketler yaratıp
+    // Grim'in flying kontrolünü tetikliyordu.
     bot.on('entityHurt', (entity) => {
-        if (entity === bot.entity) {
-            const yaw = bot.entity.yaw;
-            const knockbackStrength = 0.4;
-            bot.entity.velocity.x += -Math.sin(yaw) * knockbackStrength;
-            bot.entity.velocity.z += Math.cos(yaw) * knockbackStrength;
-            bot.entity.velocity.y += 0.2;
-        }
+        // Sunucu tarafı knockback zaten mineflayer'ın fizik motoru tarafından işleniyor.
+        // Burada ekstra bir şey yapmaya gerek yok.
     });
 
     function stopAllMovement() {
@@ -70,44 +73,81 @@ function createBot() {
         });
     }
 
-    function randomMovement() {
-        if (!botActive || connected === 0) return;
-        var waitTime = Math.floor(Math.random() * 12000) + 8000;
-        movementTimeout = setTimeout(() => {
-            if (!botActive || connected === 0) return;
-            var currentYaw = bot.entity.yaw;
-            var targetYaw = currentYaw + (Math.random() * 1.5) - 0.75;
-            var targetPitch = (Math.random() * 0.6) - 0.3;
-            bot.look(targetYaw, targetPitch, false);
-            if (Math.random() < 0.3) {
-                randomMovement();
-                return;
-            }
-            var moveDuration = Math.floor(Math.random() * 2500) + 1500;
-            var actions = ['forward', 'forward', 'forward', 'back', 'left', 'right'];
-            var action = actions[Math.floor(Math.random() * actions.length)];
-            if (action === 'forward' && Math.random() < 0.4) {
-                bot.setControlState('sprint', true);
-            }
-            bot.setControlState(action, true);
-            var midLookTimeout = setTimeout(() => {
-                if (!botActive || connected === 0) return;
-                bot.look(targetYaw + (Math.random() * 0.4) - 0.2, targetPitch, false);
-            }, moveDuration / 2);
-            movementTimeout = setTimeout(() => {
-                clearTimeout(midLookTimeout);
-                stopAllMovement();
-                randomMovement();
-            }, moveDuration);
-        }, waitTime);
+    function ticksFromMs(ms) {
+        // Minecraft tick = 50ms
+        return Math.max(1, Math.round(ms / 50));
     }
+
+    function startWaiting() {
+        var waitMs = Math.floor(Math.random() * 12000) + 8000;
+        movementState = { type: 'waiting', ticksLeft: ticksFromMs(waitMs) };
+    }
+
+    function startMoving() {
+        var currentYaw = bot.entity.yaw;
+        var targetYaw = currentYaw + (Math.random() * 1.5) - 0.75;
+        var targetPitch = (Math.random() * 0.6) - 0.3;
+        bot.look(targetYaw, targetPitch, false);
+
+        if (Math.random() < 0.3) {
+            // sadece bak, hareket etme - kısa bir bekleme sonra tekrar karar ver
+            movementState = { type: 'waiting', ticksLeft: ticksFromMs(Math.floor(Math.random() * 1000) + 500) };
+            return;
+        }
+
+        var moveDurationMs = Math.floor(Math.random() * 2500) + 1500;
+        var moveTicks = ticksFromMs(moveDurationMs);
+        var actions = ['forward', 'forward', 'forward', 'back', 'left', 'right'];
+        var action = actions[Math.floor(Math.random() * actions.length)];
+
+        if (action === 'forward' && Math.random() < 0.4) {
+            bot.setControlState('sprint', true);
+        }
+        bot.setControlState(action, true);
+
+        movementState = {
+            type: 'moving',
+            action: action,
+            ticksLeft: moveTicks,
+            midLookTick: Math.floor(moveTicks / 2),
+            midLookDone: false,
+            targetYaw: targetYaw,
+            targetPitch: targetPitch
+        };
+    }
+
+    // Her fizik tick'inde (sunucu tick'ine senkron) mevcut hareket state'ini ilerlet.
+    bot.on('physicsTick', () => {
+        if (!botActive || connected === 0 || !movementState) return;
+
+        movementState.ticksLeft--;
+
+        if (movementState.type === 'moving') {
+            if (!movementState.midLookDone && movementState.ticksLeft <= movementState.midLookTick) {
+                bot.look(
+                    movementState.targetYaw + (Math.random() * 0.4) - 0.2,
+                    movementState.targetPitch,
+                    false
+                );
+                movementState.midLookDone = true;
+            }
+            if (movementState.ticksLeft <= 0) {
+                stopAllMovement();
+                startWaiting();
+            }
+        } else if (movementState.type === 'waiting') {
+            if (movementState.ticksLeft <= 0) {
+                startMoving();
+            }
+        }
+    });
 
     function waitForGround() {
         if (!bot || !bot.entity) return;
         if (bot.entity.onGround) {
             connected = 1;
             console.log("Yerde, hareketler başlatıldı!");
-            randomMovement();
+            startWaiting();
         } else {
             setTimeout(waitForGround, 500);
         }
@@ -117,6 +157,7 @@ function createBot() {
     
     bot.on('spawn', () => {
         connected = 0;
+        movementState = null;
         console.log("Spawn olundu, giriş yapılıyor...");
         bot.chat('/register nexaria nexaria');
         setTimeout(() => { bot.chat('/login nexaria'); }, 3000);
@@ -128,7 +169,7 @@ function createBot() {
     bot.on('end', () => {
         botActive = false;
         connected = 0;
-        if (movementTimeout) clearTimeout(movementTimeout);
+        movementState = null;
         stopAllMovement();
         console.log("Bot düştü, 5 saniye sonra tekrar bağlanıyor...");
         setTimeout(checkAndConnect, 5000);
